@@ -10,11 +10,14 @@ from langsmith import traceable
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from llm_setup import llm
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
+
+os.environ['LANGCHAIN_PROJECT'] = 'RAG Chatbot2'
 
 load_dotenv()
 
@@ -36,7 +39,8 @@ def split_documents(docs, chunk_size=1000, chunk_overlap=150):
 
 @traceable(name="build_vectorstore")
 def build_vectorstore(splits, embed_model_name: str):
-    emb = OpenAIEmbeddings(model=embed_model_name)
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    emb = HuggingFaceEmbeddings(model=model_name)
     return FAISS.from_documents(splits, emb)
 
 # ----------------- cache key / fingerprint -----------------
@@ -48,20 +52,21 @@ def _file_fingerprint(path: str) -> dict:
             h.update(chunk)
     return {"sha256": h.hexdigest(), "size": p.stat().st_size, "mtime": int(p.stat().st_mtime)}
 
-def _index_key(pdf_path: str, chunk_size: int, chunk_overlap: int, embed_model_name: str) -> str:
+def _index_key(pdf_path: str, chunk_size: int, chunk_overlap: int, model_name: str) -> str:
     meta = {
         "pdf_fingerprint": _file_fingerprint(pdf_path),
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
-        "embedding_model": embed_model_name,
+        "embedding_model": model_name,
         "format": "v1",
     }
     return hashlib.sha256(json.dumps(meta, sort_keys=True).encode("utf-8")).hexdigest()
 
 # ----------------- explicitly traced load/build runs -----------------
 @traceable(name="load_index", tags=["index"])
-def load_index_run(index_dir: Path, embed_model_name: str):
-    emb = OpenAIEmbeddings(model=embed_model_name)
+def load_index_run(index_dir: Path, model_name: str):
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    emb = HuggingFaceEmbeddings(model=model_name)
     return FAISS.load_local(
         str(index_dir),
         emb,
@@ -69,17 +74,17 @@ def load_index_run(index_dir: Path, embed_model_name: str):
     )
 
 @traceable(name="build_index", tags=["index"])
-def build_index_run(pdf_path: str, index_dir: Path, chunk_size: int, chunk_overlap: int, embed_model_name: str):
+def build_index_run(pdf_path: str, index_dir: Path, chunk_size: int, chunk_overlap: int, model_name: str):
     docs = load_pdf(pdf_path)  # child
     splits = split_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)  # child
-    vs = build_vectorstore(splits, embed_model_name)  # child
+    vs = build_vectorstore(splits, model_name)  # child
     index_dir.mkdir(parents=True, exist_ok=True)
     vs.save_local(str(index_dir))
     (index_dir / "meta.json").write_text(json.dumps({
         "pdf_path": os.path.abspath(pdf_path),
         "chunk_size": chunk_size,
         "chunk_overlap": chunk_overlap,
-        "embedding_model": embed_model_name,
+        "embedding_model": model_name,
     }, indent=2))
     return vs
 
@@ -88,19 +93,19 @@ def load_or_build_index(
     pdf_path: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 150,
-    embed_model_name: str = "text-embedding-3-small",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     force_rebuild: bool = False,
 ):
-    key = _index_key(pdf_path, chunk_size, chunk_overlap, embed_model_name)
+    key = _index_key(pdf_path, chunk_size, chunk_overlap, model_name)
     index_dir = INDEX_ROOT / key
     cache_hit = index_dir.exists() and not force_rebuild
     if cache_hit:
-        return load_index_run(index_dir, embed_model_name)
+        return load_index_run(index_dir, model_name)
     else:
-        return build_index_run(pdf_path, index_dir, chunk_size, chunk_overlap, embed_model_name)
+        return build_index_run(pdf_path, index_dir, chunk_size, chunk_overlap, model_name)
 
 # ----------------- model, prompt, and pipeline -----------------
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", "Answer ONLY from the provided context. If not found, say you don't know."),
@@ -111,12 +116,12 @@ def format_docs(docs):
     return "\n\n".join(d.page_content for d in docs)
 
 @traceable(name="setup_pipeline", tags=["setup"])
-def setup_pipeline(pdf_path: str, chunk_size=1000, chunk_overlap=150, embed_model_name="text-embedding-3-small", force_rebuild=False):
+def setup_pipeline(pdf_path: str, chunk_size=1000, chunk_overlap=150, model_name="sentence-transformers/all-MiniLM-L6-v2", force_rebuild=False):
     return load_or_build_index(
         pdf_path=pdf_path,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        embed_model_name=embed_model_name,
+        model_name=model_name,
         force_rebuild=force_rebuild,
     )
 
@@ -126,10 +131,10 @@ def setup_pipeline_and_query(
     question: str,
     chunk_size: int = 1000,
     chunk_overlap: int = 150,
-    embed_model_name: str = "text-embedding-3-small",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
     force_rebuild: bool = False,
 ):
-    vectorstore = setup_pipeline(pdf_path, chunk_size, chunk_overlap, embed_model_name, force_rebuild)
+    vectorstore = setup_pipeline(pdf_path, chunk_size, chunk_overlap, model_name, force_rebuild)
     retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
     parallel = RunnableParallel({
